@@ -25,6 +25,18 @@ describe('utils tests', () => {
     expect(array2.length).toEqual(0)
   })
 
+  test('stripOrgPrefixFromTeams strips org prefixes correctly', async () => {
+    const array = utils.stripOrgPrefixFromTeams([
+      'org/team1',
+      'org/team2',
+      'team3'
+    ])
+    expect(array.length).toEqual(3)
+    expect(array[0]).toEqual('team1')
+    expect(array[1]).toEqual('team2')
+    expect(array[2]).toEqual('team3')
+  })
+
   test('getRepoPath successfully returns the path to the repository', async () => {
     expect(utils.getRepoPath()).toEqual(process.env['GITHUB_WORKSPACE'])
     expect(utils.getRepoPath('foo')).toEqual(
@@ -32,45 +44,29 @@ describe('utils tests', () => {
     )
   })
 
-  test('getRemoteDetail successfully parses remote URLs', async () => {
-    const remote1 = utils.getRemoteDetail(
-      'https://github.com/peter-evans/create-pull-request'
-    )
-    expect(remote1.protocol).toEqual('HTTPS')
-    expect(remote1.repository).toEqual('peter-evans/create-pull-request')
-
-    const remote2 = utils.getRemoteDetail(
-      'https://xxx:x-oauth-basic@github.com/peter-evans/create-pull-request'
-    )
-    expect(remote2.protocol).toEqual('HTTPS')
-    expect(remote2.repository).toEqual('peter-evans/create-pull-request')
-
-    const remote3 = utils.getRemoteDetail(
-      'git@github.com:peter-evans/create-pull-request.git'
-    )
-    expect(remote3.protocol).toEqual('SSH')
-    expect(remote3.repository).toEqual('peter-evans/create-pull-request')
-  })
-
-  test('getRemoteDetail fails to parse a remote URL', async () => {
-    const remoteUrl = 'https://github.com/peter-evans'
-    try {
-      utils.getRemoteDetail(remoteUrl)
-      // Fail the test if an error wasn't thrown
-      expect(true).toEqual(false)
-    } catch (e) {
-      expect(e.message).toEqual(
-        `The format of '${remoteUrl}' is not a valid GitHub repository URL`
-      )
-    }
-  })
-
   test('getRemoteUrl successfully returns remote URLs', async () => {
-    const url1 = utils.getRemoteUrl('HTTPS', 'peter-evans/create-pull-request')
+    const url1 = utils.getRemoteUrl(
+      'HTTPS',
+      'github.com',
+      'peter-evans/create-pull-request'
+    )
     expect(url1).toEqual('https://github.com/peter-evans/create-pull-request')
 
-    const url2 = utils.getRemoteUrl('SSH', 'peter-evans/create-pull-request')
+    const url2 = utils.getRemoteUrl(
+      'SSH',
+      'github.com',
+      'peter-evans/create-pull-request'
+    )
     expect(url2).toEqual('git@github.com:peter-evans/create-pull-request.git')
+
+    const url3 = utils.getRemoteUrl(
+      'HTTPS',
+      'mygithubserver.com',
+      'peter-evans/create-pull-request'
+    )
+    expect(url3).toEqual(
+      'https://mygithubserver.com/peter-evans/create-pull-request'
+    )
   })
 
   test('secondsSinceEpoch returns the number of seconds since the Epoch', async () => {
@@ -104,7 +100,7 @@ describe('utils tests', () => {
       utils.parseDisplayNameEmail(displayNameEmail1)
       // Fail the test if an error wasn't thrown
       expect(true).toEqual(false)
-    } catch (e) {
+    } catch (e: any) {
       expect(e.message).toEqual(
         `The format of '${displayNameEmail1}' is not a valid email address with display name`
       )
@@ -115,10 +111,78 @@ describe('utils tests', () => {
       utils.parseDisplayNameEmail(displayNameEmail2)
       // Fail the test if an error wasn't thrown
       expect(true).toEqual(false)
-    } catch (e) {
+    } catch (e: any) {
       expect(e.message).toEqual(
         `The format of '${displayNameEmail2}' is not a valid email address with display name`
       )
     }
+  })
+})
+
+describe('retryWithBackoff', () => {
+  const makeConsistencyError = () => {
+    const error = new Error(
+      'Validation Failed: "Could not resolve to a node with the global id of \'PR_abc123\'."'
+    )
+    ;(error as any).status = 422
+    return error
+  }
+
+  const shouldRetry = (e: unknown): boolean =>
+    e instanceof Error &&
+    (e as any).status === 422 &&
+    e.message.includes('Could not resolve to a node')
+
+  test('succeeds on first attempt without retrying', async () => {
+    const fn = jest.fn().mockResolvedValue('success')
+    const result = await utils.retryWithBackoff(fn, shouldRetry, 2, 1)
+    expect(result).toBe('success')
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  test('retries on eventual consistency 422 and succeeds', async () => {
+    const fn = jest
+      .fn()
+      .mockRejectedValueOnce(makeConsistencyError())
+      .mockResolvedValue('success')
+    const result = await utils.retryWithBackoff(fn, shouldRetry, 2, 1)
+    expect(result).toBe('success')
+    expect(fn).toHaveBeenCalledTimes(2)
+  })
+
+  test('exhausts retries on persistent 422 and throws', async () => {
+    const fn = jest.fn().mockRejectedValue(makeConsistencyError())
+    await expect(utils.retryWithBackoff(fn, shouldRetry, 2, 1)).rejects.toThrow(
+      'Could not resolve to a node'
+    )
+    expect(fn).toHaveBeenCalledTimes(3) // 1 initial + 2 retries
+  })
+
+  test('does not retry on non-422 errors', async () => {
+    const error = new Error('Forbidden')
+    ;(error as any).status = 403
+    const fn = jest.fn().mockRejectedValue(error)
+    await expect(utils.retryWithBackoff(fn, shouldRetry, 2, 1)).rejects.toThrow(
+      'Forbidden'
+    )
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  test('does not retry on 422 without the consistency error message', async () => {
+    const error = new Error('Validation Failed: invalid label')
+    ;(error as any).status = 422
+    const fn = jest.fn().mockRejectedValue(error)
+    await expect(utils.retryWithBackoff(fn, shouldRetry, 2, 1)).rejects.toThrow(
+      'Validation Failed: invalid label'
+    )
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  test('does not retry on plain Error objects', async () => {
+    const fn = jest.fn().mockRejectedValue(new Error('Something broke'))
+    await expect(utils.retryWithBackoff(fn, shouldRetry, 2, 1)).rejects.toThrow(
+      'Something broke'
+    )
+    expect(fn).toHaveBeenCalledTimes(1)
   })
 })

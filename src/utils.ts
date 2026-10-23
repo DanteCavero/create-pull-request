@@ -16,6 +16,16 @@ export function getStringAsArray(str: string): string[] {
     .filter(x => x !== '')
 }
 
+export function stripOrgPrefixFromTeams(teams: string[]): string[] {
+  return teams.map(team => {
+    const slashIndex = team.lastIndexOf('/')
+    if (slashIndex > 0) {
+      return team.substring(slashIndex + 1)
+    }
+    return team
+  })
+}
+
 export function getRepoPath(relativePath?: string): string {
   let githubWorkspacePath = process.env['GITHUB_WORKSPACE']
   if (!githubWorkspacePath) {
@@ -31,42 +41,14 @@ export function getRepoPath(relativePath?: string): string {
   return repoPath
 }
 
-interface RemoteDetail {
-  protocol: string
+export function getRemoteUrl(
+  protocol: string,
+  hostname: string,
   repository: string
-}
-
-export function getRemoteDetail(remoteUrl: string): RemoteDetail {
-  // Parse the protocol and github repository from a URL
-  // e.g. HTTPS, peter-evans/create-pull-request
-  const httpsUrlPattern = /^https:\/\/.*@?github.com\/(.+\/.+)$/i
-  const sshUrlPattern = /^git@github.com:(.+\/.+).git$/i
-
-  const httpsMatch = remoteUrl.match(httpsUrlPattern)
-  if (httpsMatch) {
-    return {
-      protocol: 'HTTPS',
-      repository: httpsMatch[1]
-    }
-  }
-
-  const sshMatch = remoteUrl.match(sshUrlPattern)
-  if (sshMatch) {
-    return {
-      protocol: 'SSH',
-      repository: sshMatch[1]
-    }
-  }
-
-  throw new Error(
-    `The format of '${remoteUrl}' is not a valid GitHub repository URL`
-  )
-}
-
-export function getRemoteUrl(protocol: string, repository: string): string {
+): string {
   return protocol == 'HTTPS'
-    ? `https://github.com/${repository}`
-    : `git@github.com:${repository}.git`
+    ? `https://${hostname}/${repository}`
+    : `git@${hostname}:${repository}.git`
 }
 
 export function secondsSinceEpoch(): number {
@@ -122,12 +104,14 @@ export function fileExistsSync(path: string): boolean {
   try {
     stats = fs.statSync(path)
   } catch (error) {
-    if (error.code === 'ENOENT') {
+    if (hasErrorCode(error) && error.code === 'ENOENT') {
       return false
     }
 
     throw new Error(
-      `Encountered an error when checking whether path '${path}' exists: ${error.message}`
+      `Encountered an error when checking whether path '${path}' exists: ${getErrorMessage(
+        error
+      )}`
     )
   }
 
@@ -136,4 +120,47 @@ export function fileExistsSync(path: string): boolean {
   }
 
   return false
+}
+
+export function readFile(path: string): string {
+  return fs.readFileSync(path, 'utf-8')
+}
+
+/* eslint-disable  @typescript-eslint/no-explicit-any */
+function hasErrorCode(error: any): error is {code: string} {
+  return typeof (error && error.code) === 'string'
+}
+
+export function getErrorMessage(error: unknown) {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
+export const isSelfHosted = (): boolean =>
+  process.env['RUNNER_ENVIRONMENT'] !== 'github-hosted' &&
+  (process.env['AGENT_ISSELFHOSTED'] === '1' ||
+    process.env['AGENT_ISSELFHOSTED'] === undefined)
+
+export async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  shouldRetry: (error: unknown) => boolean,
+  maxRetries = 2,
+  delayMs = 1000
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (e) {
+      if (attempt < maxRetries && shouldRetry(e)) {
+        const delay = delayMs * Math.pow(2, attempt)
+        core.info(
+          `Request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms...`
+        )
+        await new Promise(resolve => setTimeout(resolve, delay))
+      } else {
+        throw e
+      }
+    }
+  }
+  throw new Error('Unexpected: retry loop exited without return or throw')
 }
